@@ -1,0 +1,17 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userprefs
+
+# Output di build
+[Bb]in/
+[Oo]bj/
+publish/
+*.zip
+
+# Chiave di firma ClickOnce (privata, MAI committare)
+*.pfx
+
+# Log generati dal tool (contengono nomi di pazienti)
+backup_falliti_*.txt
