@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <RootNamespace>ExoCAD_Tool.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!-- La logica (senza UI) viene compilata direttamente dal progetto principale -->
+  <ItemGroup>
+    <Compile Include="..\ExoCAD Tool\JobInfo.cs" Link="Sorgenti\JobInfo.cs" />
+    <Compile Include="..\ExoCAD Tool\JobReader.cs" Link="Sorgenti\JobReader.cs" />
+    <Compile Include="..\ExoCAD Tool\BackupService.cs" Link="Sorgenti\BackupService.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="MSTest.TestAdapter" Version="3.6.1" />
+    <PackageReference Include="MSTest.TestFramework" Version="3.6.1" />
+  </ItemGroup>
+
+</Project>

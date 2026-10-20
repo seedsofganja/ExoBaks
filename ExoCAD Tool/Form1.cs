@@ -1,46 +1,103 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
 using System.Drawing;
-using System.Globalization;
+using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.IO;
-using System.Xml;
 
 namespace ExoCAD_Tool
 {
-
     public partial class Form1 : Form
     {
-        public static class Vars
-        {
-            public static string nl = Environment.NewLine;
-            public static string[] WokrsArray;
-            public static string NomePaziente;
-            public static string CognomePaziente;
-            public static string StudioDentistico;
-            public static DateTime dateTime = DateTime.Now;
-            public static int Year;
-            public static List<int> Teeth = new List<int>();
-            public static string TeethString;
-           
-        }
+        // Lavori trovati in CAD-Data (letti solo i dati principali, senza denti)
+        private List<JobInfo> _lavori = new List<JobInfo>();
+
+        // Lavori già presenti nel backup: nome cartella lavoro -> cartella di backup
+        private Dictionary<string, string> _backupEsistenti = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        // Lavoro selezionato nella griglia e caricato nei campi del form
+        private JobInfo _lavoroSelezionato;
+
+        // Non null mentre è in corso un backup (singolo o completo): usato da Annulla
+        private CancellationTokenSource _cts;
+
+        // > 0 mentre è in corso un'operazione: interfaccia bloccata
+        private int _operazioniInCorso;
+
+        // Evita di ricaricare il lavoro selezionato mentre la griglia viene ripopolata
+        private bool _popolamentoInCorso;
+
+        // Un solo file di log per sessione: backup_falliti_<avvio>.txt nella cartella di backup
+        private readonly string _inizioSessione = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+
         public Form1()
         {
             InitializeComponent();
         }
 
-        private void Form1_Load(object sender, EventArgs e)
+        private async void Form1_Load(object sender, EventArgs e)
         {
-                      
+            var impostazioni = Properties.Settings.Default;
+            if (impostazioni.UpgradeRichiesto)
+            {
+                // Dopo un aggiornamento dell'app recupera i percorsi della versione precedente
+                impostazioni.Upgrade();
+                impostazioni.UpgradeRichiesto = false;
+                impostazioni.Save();
+            }
+
+            if (Directory.Exists(impostazioni.BackUpPath))
+                BackUpPath.Text = impostazioni.BackUpPath;
+
+            string worksPath = Directory.Exists(impostazioni.WorksPath)
+                ? impostazioni.WorksPath
+                : CercaCadDataPredefinito();
+
+            if (worksPath != null)
+            {
+                WorksPathTextBox.Text = worksPath;
+                await CaricaLavori();
+            }
         }
 
-        private void ChoosePathButton_Click(object sender, EventArgs e)
+        // Percorsi tipici di ExoCAD: C:\OPT-Exocad\CAD-Data oppure C:\exocad-DentalCAD...\CAD-Data
+        private static string CercaCadDataPredefinito()
+        {
+            const string opt = @"C:\OPT-Exocad\CAD-Data";
+            if (Directory.Exists(opt))
+                return opt;
+
+            try
+            {
+                return Directory.GetDirectories(@"C:\", "exocad*")
+                    .Select(d => Path.Combine(d, "CAD-Data"))
+                    .Where(Directory.Exists)
+                    .OrderByDescending(d => d)   // la versione più recente per prima
+                    .FirstOrDefault();
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            if (_operazioniInCorso > 0)
+            {
+                MessageBox.Show(
+                    _cts != null
+                        ? "Backup in corso: premi Annulla e attendi la fine prima di chiudere."
+                        : "Operazione in corso: attendi la fine prima di chiudere.",
+                    "Operazione in corso");
+                e.Cancel = true;
+            }
+        }
+
+        private async void ChoosePathButton_Click(object sender, EventArgs e)
         {
             using (var fbd = new FolderBrowserDialog())
             {
@@ -48,12 +105,40 @@ namespace ExoCAD_Tool
                 if (result == DialogResult.OK && !string.IsNullOrWhiteSpace(fbd.SelectedPath))
                 {
                     WorksPathTextBox.Text = fbd.SelectedPath;
-                    CaricaLavori();
+                    Properties.Settings.Default.WorksPath = fbd.SelectedPath;
+                    Properties.Settings.Default.Save();
+                    await CaricaLavori();
                 }
             }
         }
 
-        public void CaricaLavori()
+        private async void ChooseBackUpFolderButton_Click(object sender, EventArgs e)
+        {
+            using (var fbd = new FolderBrowserDialog())
+            {
+                DialogResult result = fbd.ShowDialog();
+                if (result == DialogResult.OK && !string.IsNullOrWhiteSpace(fbd.SelectedPath))
+                {
+                    BackUpPath.Text = fbd.SelectedPath;
+                    Properties.Settings.Default.BackUpPath = fbd.SelectedPath;
+                    Properties.Settings.Default.Save();
+
+                    if (!string.IsNullOrWhiteSpace(WorksPathTextBox.Text))
+                        await CaricaLavori(); // aggiorna i colori
+                }
+            }
+        }
+
+        private async void LoadWorksButton_Click(object sender, EventArgs e)
+        {
+            await CaricaLavori();
+        }
+
+        // -----------------------------------------------------------------------
+        // Legge l'elenco dei lavori da CAD-Data e lo stato del backup.
+        // La lettura da disco avviene in background: la finestra resta reattiva.
+        // -----------------------------------------------------------------------
+        public async Task CaricaLavori()
         {
             // --- Validazioni iniziali ---
             if (string.IsNullOrWhiteSpace(WorksPathTextBox.Text))
@@ -72,569 +157,355 @@ namespace ExoCAD_Tool
                 return;
             }
 
-            MyWorksDataGridView.Rows.Clear();
-            MyWorksDataGridView.Refresh();
+            string worksDir = WorksPathTextBox.Text;
+            string backupDir = BackUpPath.Text;
 
+            InizioOperazione();
+            ImpostaStato("Caricamento lavori...", Color.Black);
             try
             {
-                // -----------------------------------------------------------------------
-                // OTTIMIZZAZIONE: invece di cercare su disco per ogni lavoro (lentissimo
-                // con tante cartelle), leggiamo TUTTE le sottocartelle del backup UNA SOLA
-                // volta e le mettiamo in un HashSet in memoria. La ricerca diventa O(1).
-                // -----------------------------------------------------------------------
-                var backuppedWorks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                // Le cartelle del backup vengono lette UNA SOLA volta in un dizionario:
+                // la verifica "già salvato" per ogni lavoro diventa istantanea
+                _backupEsistenti = await Task.Run(() => BackupService.ScansionaBackup(backupDir));
+                _lavori = await Task.Run(() => Directory.GetDirectories(worksDir).Select(LeggiPerElenco).ToList());
 
-                if (!string.IsNullOrWhiteSpace(BackUpPath.Text) && Directory.Exists(BackUpPath.Text))
-                    ScansionaBackup(new DirectoryInfo(BackUpPath.Text), backuppedWorks);
-
-                // -----------------------------------------------------------------------
-                // Popola la griglia e colora ogni riga in base allo stato di backup
-                // -----------------------------------------------------------------------
-                string worksDir = WorksPathTextBox.Text;
-
-                foreach (string d in Directory.GetDirectories(worksDir))
-                {
-                    string workName = Path.GetFileName(d);
-                    MyWorksDataGridView.Rows.Add(workName);
-
-                    DataGridViewRow row = MyWorksDataGridView.Rows[MyWorksDataGridView.Rows.Count - 1];
-
-                    bool salvato = backuppedWorks.Contains(workName); // ricerca in memoria, istantanea
-
-                    row.DefaultCellStyle.BackColor = salvato ? Color.LightGreen : Color.LightCoral;
-                    row.DefaultCellStyle.ForeColor = Color.Black;
-                }
+                PopolaGriglia();
+                AggiornaContatori();
             }
             catch (Exception ex)
             {
+                ImpostaStato("Errore durante il caricamento dei lavori", Color.Red);
                 MessageBox.Show("Errore durante il caricamento dei lavori:\n" + ex.Message, "Errore");
             }
-
-            // -----------------------------------------------------------------------
-            // Aggiorna i contatori in fondo al form
-            // -----------------------------------------------------------------------
-            int totale = MyWorksDataGridView.Rows.Count;
-            int nonSalvati = MyWorksDataGridView.Rows
-                .Cast<DataGridViewRow>()
-                .Count(r => r.DefaultCellStyle.BackColor == Color.LightCoral);
-
-            label1.ForeColor = Color.Black;
-            label1.Text = $"Lavori trovati: {totale}";
-
-            label2.ForeColor = nonSalvati > 0 ? Color.Red : Color.Green;
-            label2.Text = nonSalvati > 0
-                ? $"⚠ {nonSalvati} lavori non salvati"
-                : "✔ Tutti i lavori sono salvati";
-        }
-
-        // -----------------------------------------------------------------------
-        // Scansiona ricorsivamente la cartella di backup raccogliendo i nomi dei
-        // lavori salvati. Salta le cartelle di sistema (es. "System Volume
-        // Information" sulla radice di un disco) e quelle non accessibili.
-        // -----------------------------------------------------------------------
-        private static void ScansionaBackup(DirectoryInfo dir, HashSet<string> lavoriSalvati)
-        {
-            List<DirectoryInfo> sottoCartelle;
-            try
+            finally
             {
-                sottoCartelle = dir.EnumerateDirectories().ToList();
-            }
-            catch (UnauthorizedAccessException) { return; }
-            catch (IOException) { return; }
-
-            foreach (DirectoryInfo sub in sottoCartelle)
-            {
-                if ((sub.Attributes & FileAttributes.System) != 0)
-                    continue;
-
-                string workName = EstraiNomeLavoro(sub.Name);
-                if (workName != null)
-                    lavoriSalvati.Add(workName); // cartella paziente: non serve scendere oltre
-                else
-                    ScansionaBackup(sub, lavoriSalvati);
+                FineOperazione();
             }
         }
 
-        // -----------------------------------------------------------------------
-        // Il nome cartella ha il formato: "Nome Cognome Denti (NomeLavoro)".
-        // Restituisce il NomeLavoro contenuto nelle parentesi FINALI, cercando la
-        // parentesi aperta corrispondente (così funziona anche se il nome del
-        // lavoro contiene a sua volta delle parentesi). Le cartelle che non
-        // terminano con ')' (es. backup incompleti "... (Lavoro).tmp") restituiscono null.
-        // -----------------------------------------------------------------------
-        private static string EstraiNomeLavoro(string dirName)
-        {
-            if (!dirName.EndsWith(")"))
-                return null;
-
-            int profondita = 0;
-            for (int i = dirName.Length - 1; i >= 0; i--)
-            {
-                if (dirName[i] == ')') profondita++;
-                else if (dirName[i] == '(') profondita--;
-
-                if (profondita == 0)
-                    return dirName.Substring(i + 1, dirName.Length - i - 2).Trim();
-            }
-            return null;
-        }
-
-        private void LoadWorksButton_Click(object sender, EventArgs e)
-        {
-
-                CaricaLavori();
-
-        }
-        public void ClearForm()
-        {
-            Denti.Text = "";
-            NomePaziente.Text = ""; ;
-            CognomePaziente.Text = ""; ;
-            StudioDentistico.Text = ""; ;
-            dateTimePicker1.Value = DateTime.Now;
-        }
-        public void LoadSelectedWork()
+        private static JobInfo LeggiPerElenco(string percorsoLavoro)
         {
             try
             {
-                label1.Text = "";
-                Vars.TeethString = null;
-                Vars.NomePaziente = null;
-                Vars.CognomePaziente = null;
-                Vars.StudioDentistico = null;
-
-                if (MyWorksDataGridView.Rows.Count < 1 || MyWorksDataGridView.SelectedRows.Count != 1)
-                    return;
-
-                string dP = ".dentalProject";
-                string cI = ".constructionInfo";
-                string ProjectName = MyWorksDataGridView.SelectedRows[0].Cells[0].Value.ToString();
-                string path = WorksPathTextBox.Text + "\\" + ProjectName;
-                string dentalProject = path + "\\" + ProjectName + dP;
-                string constructionInfo = path + "\\" + ProjectName + cI;
-
-                XmlDocument xml = new XmlDocument();
-
-                // Data di default = creazione della cartella del lavoro, così un lavoro
-                // senza DateTime non eredita la data (e l'anno) del lavoro precedente
-                Vars.dateTime = Directory.GetCreationTime(path);
-                Vars.Year = Vars.dateTime.Year;
-
-                // DentalProject — carica sempre nome, cognome, studio, data
-                if (File.Exists(dentalProject))
-                {
-                    xml.Load(dentalProject);
-
-                    XmlNode xmlNode;
-
-                    xmlNode = xml.SelectSingleNode("//PatientFirstName");
-                    Vars.NomePaziente = xmlNode?.InnerText ?? "";
-
-                    xmlNode = xml.SelectSingleNode("//PatientName");
-                    Vars.CognomePaziente = xmlNode?.InnerText ?? "";
-
-                    xmlNode = xml.SelectSingleNode("//PracticeName");
-                    Vars.StudioDentistico = xmlNode?.InnerText ?? "";
-
-                    xmlNode = xml.SelectSingleNode("//DateTime");
-                    if (xmlNode != null &&
-                        (DateTime.TryParse(xmlNode.InnerText, out DateTime dt) ||
-                         DateTime.TryParse(xmlNode.InnerText, CultureInfo.InvariantCulture, DateTimeStyles.None, out dt)))
-                    {
-                        Vars.dateTime = dt;
-                        Vars.Year = dt.Year;
-                    }
-                }
-                else
-                {
-                    Vars.NomePaziente = "";
-                    Vars.CognomePaziente = "";
-                    Vars.StudioDentistico = "";
-                }
-
-                // Denti — prima provo .constructionInfo, altrimenti leggo dal .dentalProject già caricato
-                if (File.Exists(constructionInfo))
-                {
-                    XmlDocument xmlCI = new XmlDocument();
-                    xmlCI.Load(constructionInfo);
-
-                    var teeth = xmlCI.SelectNodes("//Tooth/Number");
-                    Vars.Teeth.Clear();
-                    foreach (XmlNode node in teeth)
-                    {
-                        if (int.TryParse(node.InnerText, out int t))
-                            Vars.Teeth.Add(t);
-                    }
-                }
-                else
-                {
-                    // Lavoro parziale: leggo i denti dal .dentalProject già caricato, escludo gli Antagonist
-                    var teeth = xml.SelectNodes("//Teeth/Tooth");
-                    Vars.Teeth.Clear();
-                    foreach (XmlNode node in teeth)
-                    {
-                        XmlNode recType = node.SelectSingleNode("ReconstructionType");
-                        if (recType != null && recType.InnerText == "Antagonist") continue;
-
-                        XmlNode numNode = node.SelectSingleNode("Number");
-                        if (numNode != null && int.TryParse(numNode.InnerText, out int t))
-                            Vars.Teeth.Add(t);
-                    }
-                }
-
-                // Rimuove i duplicati, ordina e costruisce la stringa range (es. "11-13 15 43")
-                Vars.Teeth = Vars.Teeth.Distinct().OrderBy(t => t).ToList();
-                string teethString = "";
-                int count = Vars.Teeth.Count;
-                int i = 0;
-                while (i < count)
-                {
-                    int start = Vars.Teeth[i];
-                    int end = start;
-                    while (i + 1 < count && Vars.Teeth[i + 1] == Vars.Teeth[i] + 1)
-                    {
-                        end = Vars.Teeth[i + 1];
-                        i++;
-                    }
-                    if (teethString != "") teethString += " ";
-                    if (end > start)
-                        teethString += start + "-" + end;
-                    else
-                        teethString += start;
-                    i++;
-                }
-                Vars.TeethString = teethString;
-
-                // Aggiorna i campi del form
-                Denti.Text = Vars.TeethString;
-                NomePaziente.Text = Vars.NomePaziente;
-                CognomePaziente.Text = Vars.CognomePaziente;
-                StudioDentistico.Text = Vars.StudioDentistico;
-                dateTimePicker1.Value = Vars.dateTime;
+                return JobReader.Leggi(percorsoLavoro, leggiDenti: false);
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                label1.ForeColor = Color.Red;
-                label1.Text = "Errore nel caricamento: " + ex.Message;
+                // XML illeggibile: il lavoro compare comunque, con i soli dati della cartella
+                return JobReader.SoloCartella(percorsoLavoro);
             }
         }
-        private void LoadSelectedWorkButton_Click(object sender, EventArgs e)
+
+        // -----------------------------------------------------------------------
+        // Riempie la griglia applicando i filtri e colora ogni riga in base allo
+        // stato di backup (verde = salvato, rosso = non salvato)
+        // -----------------------------------------------------------------------
+        private void PopolaGriglia()
         {
-            ClearForm();
+            string selezionato = _lavoroSelezionato?.CartellaLavoro;
+            string filtro = CercaTextBox.Text.Trim();
+
+            _popolamentoInCorso = true;
+            try
+            {
+                MyWorksDataGridView.Rows.Clear();
+
+                var righe = new List<DataGridViewRow>();
+                foreach (JobInfo job in _lavori)
+                {
+                    bool salvato = _backupEsistenti.ContainsKey(job.CartellaLavoro);
+
+                    if (SoloNonSalvatiCheckBox.Checked && salvato) continue;
+                    if (filtro != "" && !Corrisponde(job, filtro)) continue;
+
+                    var row = new DataGridViewRow();
+                    row.CreateCells(MyWorksDataGridView, job.CartellaLavoro, job.Paziente, job.Studio, job.Data);
+                    row.Tag = job;
+                    ColoraRiga(row, salvato);
+                    righe.Add(row);
+                }
+                MyWorksDataGridView.Rows.AddRange(righe.ToArray());
+
+                // Ripristina la selezione precedente se il lavoro è ancora visibile
+                MyWorksDataGridView.ClearSelection();
+                DataGridViewRow daSelezionare =
+                    righe.FirstOrDefault(r => ((JobInfo)r.Tag).CartellaLavoro == selezionato) ?? righe.FirstOrDefault();
+                if (daSelezionare != null)
+                {
+                    daSelezionare.Selected = true;
+                    MyWorksDataGridView.CurrentCell = daSelezionare.Cells[0];
+                }
+            }
+            finally
+            {
+                _popolamentoInCorso = false;
+            }
+
             LoadSelectedWork();
         }
 
-        private void ChooseBackUpFolderButton_Click(object sender, EventArgs e)
+        private static bool Corrisponde(JobInfo job, string filtro)
         {
-            using (var fbd = new FolderBrowserDialog())
+            return new[] { job.CartellaLavoro, job.Paziente, job.Studio }
+                .Any(campo => campo.IndexOf(filtro, StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        private static void ColoraRiga(DataGridViewRow row, bool salvato)
+        {
+            row.DefaultCellStyle.BackColor = salvato ? Color.LightGreen : Color.LightCoral;
+            row.DefaultCellStyle.ForeColor = Color.Black;
+        }
+
+        private void AggiornaRigaSalvata(string cartellaLavoro)
+        {
+            foreach (DataGridViewRow row in MyWorksDataGridView.Rows)
             {
-                DialogResult result = fbd.ShowDialog();
-                if (result == DialogResult.OK && !string.IsNullOrWhiteSpace(fbd.SelectedPath))
-                {
-                    BackUpPath.Text = fbd.SelectedPath;
-                    CaricaLavori(); // aggiorna i colori
-                }
+                if (((JobInfo)row.Tag).CartellaLavoro == cartellaLavoro)
+                    ColoraRiga(row, true);
             }
         }
-        // Variabile di classe per accumulare i fallimenti durante il loop
-        private readonly List<string> _backupFalliti = new List<string>();
 
-        // Impostata da DoBackUp in modalità loop quando il disco di backup è pieno:
-        // il loop si interrompe invece di proseguire con tutti i lavori rimanenti
-        private bool _spazioEsaurito;
-
-        public void DoBackUp(bool isLoopMode = false)
+        private void AggiornaContatori()
         {
+            int totale = _lavori.Count;
+            int nonSalvati = _lavori.Count(j => !_backupEsistenti.ContainsKey(j.CartellaLavoro));
+
+            ContatoreLabel.ForeColor = nonSalvati > 0 ? Color.Red : Color.Green;
+            ContatoreLabel.Text = $"Lavori trovati: {totale}  —  " +
+                (nonSalvati > 0 ? $"⚠ {nonSalvati} lavori non salvati" : "✔ Tutti i lavori sono salvati");
+        }
+
+        private void CercaTextBox_TextChanged(object sender, EventArgs e)
+        {
+            PopolaGriglia();
+        }
+
+        private void SoloNonSalvatiCheckBox_CheckedChanged(object sender, EventArgs e)
+        {
+            PopolaGriglia();
+        }
+
+        public void ClearForm()
+        {
+            _lavoroSelezionato = null;
+            Denti.Text = "";
+            NomePaziente.Text = "";
+            CognomePaziente.Text = "";
+            StudioDentistico.Text = "";
+            DataLavoroPicker.Value = DateTime.Now;
+        }
+
+        // -----------------------------------------------------------------------
+        // Carica nei campi del form i dati del lavoro selezionato (letti dagli XML).
+        // I campi sono modificabili prima del backup singolo.
+        // -----------------------------------------------------------------------
+        public void LoadSelectedWork()
+        {
+            ClearForm();
+
+            if (MyWorksDataGridView.SelectedRows.Count != 1)
+                return;
+
+            var job = (JobInfo)MyWorksDataGridView.SelectedRows[0].Tag;
             try
             {
-                // --- Validazioni ---
-                if (string.IsNullOrWhiteSpace(BackUpPath.Text))
-                {
-                    label1.ForeColor = Color.Red;
-                    label1.Text = "Cartella di backup non specificata";
-                    return;
-                }
-
-                if (MyWorksDataGridView.SelectedRows.Count < 1)
-                {
-                    label1.ForeColor = Color.Red;
-                    label1.Text = "Nessun lavoro selezionato";
-                    return;
-                }
-
-                // Legge i campi dal form (potrebbero essere stati modificati manualmente)
-                // e li rende validi come nomi di cartella (es. "Rossi/Bianchi" -> "Rossi-Bianchi")
-                string nome = SanificaNome(NomePaziente.Text);
-                string cognome = SanificaNome(CognomePaziente.Text);
-                string studio = SanificaNome(StudioDentistico.Text);
-                string denti = SanificaNome(Denti.Text);
-                DateTime data = dateTimePicker1.Value;
-                string workFolder = MyWorksDataGridView.SelectedRows[0].Cells[0].Value.ToString();
-
-                // Permette il backup anche se nome o cognome mancano (ma almeno uno dei due serve)
-                if (string.IsNullOrWhiteSpace(studio) ||
-                    string.IsNullOrWhiteSpace(denti) ||
-                    (string.IsNullOrWhiteSpace(nome) && string.IsNullOrWhiteSpace(cognome)))
-                {
-                    string motivo = "Dati mancanti (studio/denti/paziente)";
-                    label1.ForeColor = Color.Red;
-                    label1.Text = $"Impossibile salvare: {motivo}";
-
-                    // Registra il fallimento con i dati disponibili
-                    RegistraFallimento(workFolder, nome, cognome, denti, data, motivo);
-                    return;
-                }
-
-                // --- Costruisce la struttura di cartelle ---
-                string workPath = WorksPathTextBox.Text + "\\" + workFolder;
-                string yearFolder = Path.Combine(BackUpPath.Text, data.Year.ToString());
-                string studioFolder = Path.Combine(yearFolder, studio);
-                string pazienteFolder = Path.Combine(
-                    studioFolder,
-                    $"{nome} {cognome} {denti} ({workFolder})"
-                );
-
-                // Un backup nuovo viene scritto in "<cartella>.tmp" e rinominato solo a
-                // copia completata: se si interrompe, il lavoro resta "non salvato"
-                // (CaricaLavori ignora le cartelle che non terminano con ')').
-                // Se la cartella esiste già, si aggiornano i file al suo interno.
-                bool cartellaNuova = !Directory.Exists(pazienteFolder);
-                string cartellaDestinazione = cartellaNuova ? pazienteFolder + ".tmp" : pazienteFolder;
-
-                Directory.CreateDirectory(cartellaDestinazione);
-
-                // --- Copia i file uno per uno ---
-                foreach (string file in Directory.GetFiles(workPath))
-                {
-                    string destPath = Path.Combine(cartellaDestinazione, Path.GetFileName(file));
-
-                    if (FileGiaCopiato(file, destPath))
-                        continue; // già copiato e invariato, salta
-
-                    long fileSize = new FileInfo(file).Length;
-                    long freeSpace = SpazioLibero(BackUpPath.Text); // riletto ad ogni file, -1 se non disponibile
-
-                    if (freeSpace >= 0 && freeSpace <= fileSize)
-                    {
-                        string motivo = "Spazio sul disco di backup esaurito";
-                        RegistraFallimento(workFolder, nome, cognome, denti, data, motivo);
-
-                        if (isLoopMode)
-                            _spazioEsaurito = true; // il messaggio lo mostra il loop, una volta sola
-                        else
-                            MessageBox.Show(motivo, "Spazio insufficiente");
-
-                        label1.ForeColor = Color.Red;
-                        label1.Text = motivo;
-                        return;
-                    }
-
-                    CopiaFileSicura(file, destPath);
-                }
-
-                if (cartellaNuova)
-                    Directory.Move(cartellaDestinazione, pazienteFolder);
-
-                label1.ForeColor = Color.Green;
-                label1.Text = "Lavoro salvato";
-
-                // In modalità loop non ricarichiamo la griglia ad ogni passo (troppo lento):
-                // lo farà LoopBackUpButton_Click alla fine
-                if (!isLoopMode)
-                    CaricaLavori();
+                _lavoroSelezionato = JobReader.Leggi(job.PercorsoLavoro, leggiDenti: true);
+                ImpostaStato("", Color.Black);
             }
             catch (Exception ex)
             {
-                string motivo = ex.Message;
-                label1.ForeColor = Color.Red;
-                label1.Text = "Errore backup: " + motivo;
-
-                // Tentiamo di registrare il fallimento anche in caso di eccezione
-                try
-                {
-                    string workFolder = MyWorksDataGridView.SelectedRows.Count > 0
-                        ? MyWorksDataGridView.SelectedRows[0].Cells[0].Value.ToString()
-                        : "Sconosciuto";
-
-                    RegistraFallimento(
-                        workFolder,
-                        NomePaziente.Text.Trim(),
-                        CognomePaziente.Text.Trim(),
-                        Denti.Text.Trim(),
-                        dateTimePicker1.Value,
-                        motivo
-                    );
-                }
-                catch { /* ignora errori secondari nel log */ }
+                // I campi restano vuoti ma modificabili: si possono completare a mano
+                _lavoroSelezionato = JobReader.SoloCartella(job.PercorsoLavoro);
+                ImpostaStato("Errore nel caricamento: " + ex.Message, Color.Red);
             }
+
+            Denti.Text = _lavoroSelezionato.Denti;
+            NomePaziente.Text = _lavoroSelezionato.Nome;
+            CognomePaziente.Text = _lavoroSelezionato.Cognome;
+            StudioDentistico.Text = _lavoroSelezionato.Studio;
+            DataLavoroPicker.Value = _lavoroSelezionato.Data;
         }
 
-        // -----------------------------------------------------------------------
-        // Rende un testo valido come nome di cartella: sostituisce i caratteri non
-        // ammessi da Windows con '-' e toglie spazi e punti finali.
-        // -----------------------------------------------------------------------
-        private static string SanificaNome(string testo)
+        private void LoadSelectedWorkButton_Click(object sender, EventArgs e)
         {
-            char[] nonValidi = Path.GetInvalidFileNameChars();
-            var sb = new StringBuilder(testo.Length);
-            foreach (char c in testo)
-                sb.Append(nonValidi.Contains(c) ? '-' : c);
-
-            return sb.ToString().Trim().TrimEnd('.', ' ');
-        }
-
-        // -----------------------------------------------------------------------
-        // Un file è considerato già copiato solo se esiste con stessa dimensione e
-        // stessa data di modifica (tolleranza 2s per dischi FAT/exFAT): così i file
-        // copiati a metà o modificati in ExoCAD dopo il backup vengono ricopiati.
-        // -----------------------------------------------------------------------
-        private static bool FileGiaCopiato(string origine, string destinazione)
-        {
-            if (!File.Exists(destinazione))
-                return false;
-
-            var o = new FileInfo(origine);
-            var d = new FileInfo(destinazione);
-            return o.Length == d.Length &&
-                   Math.Abs((o.LastWriteTimeUtc - d.LastWriteTimeUtc).TotalSeconds) <= 2;
-        }
-
-        // -----------------------------------------------------------------------
-        // Copia su un file ".part" e lo rinomina solo a copia completata: un file
-        // interrotto a metà non viene mai scambiato per un file valido.
-        // -----------------------------------------------------------------------
-        private static void CopiaFileSicura(string origine, string destinazione)
-        {
-            string temp = destinazione + ".part";
-
-            if (File.Exists(temp))
-                File.SetAttributes(temp, FileAttributes.Normal);
-            File.Copy(origine, temp, true);
-
-            if (File.Exists(destinazione))
-            {
-                File.SetAttributes(destinazione, FileAttributes.Normal);
-                File.Delete(destinazione);
-            }
-            File.Move(temp, destinazione);
-        }
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool GetDiskFreeSpaceEx(string lpDirectoryName,
-            out ulong lpFreeBytesAvailable, out ulong lpTotalNumberOfBytes, out ulong lpTotalNumberOfFreeBytes);
-
-        // -----------------------------------------------------------------------
-        // Spazio libero sul disco che contiene la cartella. Funziona anche con
-        // percorsi di rete (\\NAS\backup), dove DriveInfo lancia un'eccezione.
-        // Restituisce -1 se non è possibile determinarlo.
-        // -----------------------------------------------------------------------
-        private static long SpazioLibero(string cartella)
-        {
-            string percorso = cartella.EndsWith("\\") ? cartella : cartella + "\\";
-
-            if (GetDiskFreeSpaceEx(percorso, out ulong libero, out _, out _))
-                return (long)Math.Min(libero, (ulong)long.MaxValue);
-
-            return -1;
-        }
-
-        // -----------------------------------------------------------------------
-        // Aggiunge una riga alla lista dei fallimenti (usata poi da ScriviLogFalliti)
-        // -----------------------------------------------------------------------
-        private void RegistraFallimento(string workFolder, string nome, string cognome,
-                                         string denti, DateTime data, string motivo)
-        {
-            string riga = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] " +
-                          $"Lavoro: {workFolder} | " +
-                          $"Paziente: {nome} {cognome} | " +
-                          $"Denti: {(string.IsNullOrWhiteSpace(denti) ? "N/D" : denti)} | " +
-                          $"Data lavoro: {data:dd/MM/yyyy} | " +
-                          $"Motivo: {motivo}";
-
-            _backupFalliti.Add(riga);
-        }
-
-        // -----------------------------------------------------------------------
-        // Scrive il file di log nella cartella di backup.
-        // Chiamato alla fine del loop (o del singolo backup se vuoi).
-        // -----------------------------------------------------------------------
-        private void ScriviLogFalliti()
-        {
-            if (_backupFalliti.Count == 0)
-                return;
-
-            if (string.IsNullOrWhiteSpace(BackUpPath.Text) || !Directory.Exists(BackUpPath.Text))
-                return;
-
-            string timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-            string logPath = Path.Combine(BackUpPath.Text, $"backup_falliti_{timestamp}.txt");
-
-            var righe = new List<string>();
-            righe.Add($"=== Log backup falliti — {DateTime.Now:dd/MM/yyyy HH:mm:ss} ===");
-            righe.Add($"Totale fallimenti: {_backupFalliti.Count}");
-            righe.Add("");
-            righe.AddRange(_backupFalliti);
-
-            File.WriteAllLines(logPath, righe, Encoding.UTF8);
-
-            label1.ForeColor = Color.OrangeRed;
-            label1.Text = $"⚠ {_backupFalliti.Count} lavori non salvati — vedi log in backup";
-        }
-        private void BackUpButton_Click(object sender, EventArgs e)
-        {
-            DoBackUp();
+            LoadSelectedWork(); // ricarica dagli XML, annullando le modifiche manuali
         }
 
         private void MyWorksDataGridView_SelectionChanged(object sender, EventArgs e)
         {
-            ClearForm();
-            LoadSelectedWork();
+            if (!_popolamentoInCorso)
+                LoadSelectedWork();
         }
 
+        private bool ControllaCartellaBackup()
+        {
+            if (!string.IsNullOrWhiteSpace(BackUpPath.Text) && Directory.Exists(BackUpPath.Text))
+                return true;
+
+            ImpostaStato("Cartella di backup non specificata o non raggiungibile", Color.Red);
+            return false;
+        }
+
+        // -----------------------------------------------------------------------
+        // Backup del lavoro selezionato, usando i valori dei campi del form
+        // (possono essere stati modificati manualmente)
+        // -----------------------------------------------------------------------
+        private async void BackUpButton_Click(object sender, EventArgs e)
+        {
+            if (!ControllaCartellaBackup())
+                return;
+
+            if (_lavoroSelezionato == null)
+            {
+                ImpostaStato("Nessun lavoro selezionato", Color.Red);
+                return;
+            }
+
+            var job = new JobInfo
+            {
+                CartellaLavoro = _lavoroSelezionato.CartellaLavoro,
+                PercorsoLavoro = _lavoroSelezionato.PercorsoLavoro,
+                Nome = NomePaziente.Text,
+                Cognome = CognomePaziente.Text,
+                Studio = StudioDentistico.Text,
+                Denti = Denti.Text,
+                Data = DataLavoroPicker.Value
+            };
+
+            string motivo = BackupService.Valida(job);
+            if (motivo != null)
+            {
+                ImpostaStato("Impossibile salvare: " + motivo, Color.Red);
+                RegistraFallimenti(new[] { RigaFallimento(job, motivo) });
+                return;
+            }
+
+            string backupRoot = BackUpPath.Text;
+            _backupEsistenti.TryGetValue(job.CartellaLavoro, out string esistente);
+
+            // Se il lavoro è già salvato con dati diversi (es. denti o nome corretti a mano)
+            // chiede se spostare la cartella esistente invece di aggiornarla dov'è
+            bool sposta = false;
+            if (esistente != null && Directory.Exists(esistente))
+            {
+                string desiderata = BackupService.CartellaDestinazione(backupRoot, job);
+                if (!string.Equals(esistente, desiderata, StringComparison.OrdinalIgnoreCase))
+                {
+                    DialogResult risposta = MessageBox.Show(
+                        "Questo lavoro è già salvato in:\n" + esistente +
+                        "\n\nVuoi spostare e rinominare la cartella con i dati attuali?\n" + desiderata +
+                        "\n\nSì = sposta e aggiorna\nNo = aggiorna la cartella esistente",
+                        "Backup già presente", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+
+                    if (risposta == DialogResult.Cancel)
+                        return;
+                    sposta = risposta == DialogResult.Yes;
+                }
+            }
+
+            _cts = new CancellationTokenSource();
+            CancellationToken ct = _cts.Token;
+            InizioOperazione();
+            AnnullaButton.Enabled = true;
+            ImpostaStato("Backup in corso: " + job.CartellaLavoro, Color.Black);
+            try
+            {
+                string destinazione = await Task.Run(() => BackupService.Esegui(job, backupRoot, esistente, sposta, ct));
+
+                _backupEsistenti[job.CartellaLavoro] = destinazione;
+                AggiornaRigaSalvata(job.CartellaLavoro);
+                AggiornaContatori();
+                ImpostaStato("Lavoro salvato", Color.Green);
+            }
+            catch (OperationCanceledException)
+            {
+                ImpostaStato("Backup annullato", Color.OrangeRed);
+            }
+            catch (SpazioEsauritoException ex)
+            {
+                ImpostaStato(ex.Message, Color.Red);
+                RegistraFallimenti(new[] { RigaFallimento(job, ex.Message) });
+                MessageBox.Show(ex.Message, "Spazio insufficiente");
+            }
+            catch (Exception ex)
+            {
+                ImpostaStato("Errore backup: " + ex.Message, Color.Red);
+                RegistraFallimenti(new[] { RigaFallimento(job, ex.Message) });
+            }
+            finally
+            {
+                AnnullaButton.Enabled = false;
+                _cts.Dispose();
+                _cts = null;
+                FineOperazione();
+            }
+        }
+
+        private class EsitoBackup
+        {
+            public readonly List<string> Falliti = new List<string>();
+            public int Elaborati;
+            public bool Annullato;
+            public bool SpazioEsaurito;
+        }
+
+        // -----------------------------------------------------------------------
+        // Backup completo: di default salva solo i lavori non ancora salvati; con
+        // la spunta "Aggiorna anche i lavori già salvati" sincronizza tutto.
+        // Usa i dati letti dagli XML di ogni lavoro.
+        // -----------------------------------------------------------------------
         private async void LoopBackUpButton_Click(object sender, EventArgs e)
         {
-            _backupFalliti.Clear(); // pulisce i fallimenti del run precedente
-            _spazioEsaurito = false;
+            if (!ControllaCartellaBackup())
+                return;
 
-            int totale = MyWorksDataGridView.Rows.Count;
-            progressBar1.Value = 0;
-            progressBar1.Maximum = totale;
-            progressBar1.Step = 1;
+            bool aggiornaSalvati = AggiornaSalvatiCheckBox.Checked;
+            List<JobInfo> daSalvare = _lavori
+                .Where(j => aggiornaSalvati || !_backupEsistenti.ContainsKey(j.CartellaLavoro))
+                .ToList();
 
-            // Blocca tutta l'interfaccia: un click su griglia o pulsanti durante il
-            // loop cambierebbe il lavoro selezionato o svuoterebbe la griglia
-            ImpostaInterfacciaAttiva(false);
+            if (daSalvare.Count == 0)
+            {
+                MessageBox.Show("Tutti i lavori sono già salvati ✔", "Backup");
+                return;
+            }
+
+            string backupRoot = BackUpPath.Text;
+            var esistenti = new Dictionary<string, string>(_backupEsistenti, StringComparer.OrdinalIgnoreCase);
+
+            BackupProgressBar.Value = 0;
+            BackupProgressBar.Maximum = daSalvare.Count;
+            var progresso = new Progress<int>(i =>
+            {
+                BackupProgressBar.Value = i;
+                ImpostaStato($"Backup {i + 1} di {daSalvare.Count}: {daSalvare[i].CartellaLavoro}", Color.Black);
+            });
+
+            _cts = new CancellationTokenSource();
+            CancellationToken ct = _cts.Token;
+            InizioOperazione();
+            AnnullaButton.Enabled = true;
 
             string msg;
             try
             {
-                foreach (DataGridViewRow row in MyWorksDataGridView.Rows)
-                {
-                    row.Selected = true;
-                    MyWorksDataGridView.CurrentCell = MyWorksDataGridView.Rows[row.Index].Cells[0];
+                EsitoBackup esito = await Task.Run(() => BackupCompleto(daSalvare, esistenti, backupRoot, progresso, ct));
 
-                    await Task.Delay(1); // lascia aggiornare la UI senza bloccare il thread
+                BackupProgressBar.Value = esito.Elaborati;
+                RegistraFallimenti(esito.Falliti);
+                await CaricaLavori(); // ricarica la griglia UNA SOLA VOLTA alla fine
 
-                    DoBackUp(isLoopMode: true); // passa true: non ricarica la griglia ad ogni passo
-
-                    progressBar1.Value++;
-
-                    if (_spazioEsaurito)
-                        break;
-
-                    await Task.Delay(1);
-                }
-
-                CaricaLavori();          // ricarica la griglia UNA SOLA VOLTA alla fine
-                ScriviLogFalliti();      // scrive il log solo se ci sono stati problemi
-
-                if (_spazioEsaurito)
+                if (esito.SpazioEsaurito)
                     msg = "Backup interrotto: spazio esaurito sul disco di backup.";
-                else if (_backupFalliti.Count == 0)
+                else if (esito.Annullato)
+                    msg = $"Backup annullato dopo {esito.Elaborati} lavori su {daSalvare.Count}.";
+                else if (esito.Falliti.Count == 0)
                     msg = "Backup completato senza errori ✔";
                 else
-                    msg = $"Backup completato con {_backupFalliti.Count} errori.\nVedi il file log nella cartella di backup.";
+                    msg = "Backup completato.";
+
+                if (esito.Falliti.Count > 0)
+                    msg += $"\n{esito.Falliti.Count} lavori non salvati: vedi il file log nella cartella di backup.";
             }
             catch (Exception ex)
             {
@@ -642,33 +513,158 @@ namespace ExoCAD_Tool
             }
             finally
             {
-                ImpostaInterfacciaAttiva(true);
+                AnnullaButton.Enabled = false;
+                _cts.Dispose();
+                _cts = null;
+                FineOperazione();
             }
 
+            ImpostaStato(msg.Split('\n')[0], Color.Black);
             MessageBox.Show(msg, "Backup");
         }
 
-        private void ImpostaInterfacciaAttiva(bool attiva)
+        // Eseguito in background: non deve toccare i controlli del form
+        private static EsitoBackup BackupCompleto(List<JobInfo> lavori, Dictionary<string, string> esistenti,
+                                                  string backupRoot, IProgress<int> progresso, CancellationToken ct)
         {
-            MyWorksDataGridView.Enabled = attiva;
-            ChoosePathButton.Enabled = attiva;
-            LoadWorksButton.Enabled = attiva;
-            LoadSelectedWorkButton.Enabled = attiva;
-            ChooseBackUpFolderButton.Enabled = attiva;
-            BackUpButton.Enabled = attiva;
-            LoopBackUpButton.Enabled = attiva;
-            UseWaitCursor = !attiva;
+            var esito = new EsitoBackup();
+
+            for (int i = 0; i < lavori.Count; i++)
+            {
+                if (ct.IsCancellationRequested)
+                {
+                    esito.Annullato = true;
+                    break;
+                }
+
+                progresso.Report(i);
+
+                JobInfo job = lavori[i];
+                try
+                {
+                    job = JobReader.Leggi(job.PercorsoLavoro, leggiDenti: true);
+
+                    string motivo = BackupService.Valida(job);
+                    if (motivo != null)
+                    {
+                        esito.Falliti.Add(RigaFallimento(job, motivo));
+                    }
+                    else
+                    {
+                        esistenti.TryGetValue(job.CartellaLavoro, out string esistente);
+                        BackupService.Esegui(job, backupRoot, esistente, false, ct);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    esito.Annullato = true;
+                    break;
+                }
+                catch (SpazioEsauritoException ex)
+                {
+                    esito.Falliti.Add(RigaFallimento(job, ex.Message));
+                    esito.SpazioEsaurito = true;
+                    esito.Elaborati = i + 1;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    esito.Falliti.Add(RigaFallimento(job, ex.Message));
+                }
+
+                esito.Elaborati = i + 1;
+            }
+
+            return esito;
         }
 
-        private bool IsWorkBackedUp(string workName)
+        private void AnnullaButton_Click(object sender, EventArgs e)
         {
-            if (string.IsNullOrWhiteSpace(BackUpPath.Text) || !Directory.Exists(BackUpPath.Text))
-                return false;
+            _cts?.Cancel();
+            AnnullaButton.Enabled = false;
+            ImpostaStato("Annullamento in corso: attendo la fine del file corrente...", Color.OrangeRed);
+        }
 
-            // Cerca ricorsivamente una cartella che contenga (NomeLavoro) nel nome
-            var found = Directory.GetDirectories(BackUpPath.Text, $"*({workName})", SearchOption.AllDirectories);
-            return found.Length > 0;
+        // -----------------------------------------------------------------------
+        // Riga di log per un lavoro non salvato
+        // -----------------------------------------------------------------------
+        private static string RigaFallimento(JobInfo job, string motivo)
+        {
+            return $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] " +
+                   $"Lavoro: {job.CartellaLavoro} | " +
+                   $"Paziente: {job.Nome} {job.Cognome} | " +
+                   $"Denti: {(string.IsNullOrWhiteSpace(job.Denti) ? "N/D" : job.Denti)} | " +
+                   $"Data lavoro: {job.Data:dd/MM/yyyy} | " +
+                   $"Motivo: {motivo}";
+        }
+
+        // -----------------------------------------------------------------------
+        // Aggiunge i fallimenti al log della sessione nella cartella di backup
+        // (un file per ogni avvio dell'app, sia per i backup singoli che completi)
+        // -----------------------------------------------------------------------
+        private void RegistraFallimenti(IList<string> righe)
+        {
+            if (righe.Count == 0 || !Directory.Exists(BackUpPath.Text))
+                return;
+
+            try
+            {
+                string logPath = Path.Combine(BackUpPath.Text, $"backup_falliti_{_inizioSessione}.txt");
+
+                var testo = new List<string>();
+                if (!File.Exists(logPath))
+                {
+                    testo.Add($"=== Log backup falliti — sessione del {DateTime.Now:dd/MM/yyyy HH:mm:ss} ===");
+                    testo.Add("");
+                }
+                testo.AddRange(righe);
+
+                File.AppendAllLines(logPath, testo, Encoding.UTF8);
+            }
+            catch (Exception)
+            {
+                // es. disco pieno: l'errore è già mostrato nella barra di stato
+            }
+        }
+
+        private void ImpostaStato(string testo, Color colore)
+        {
+            StatoLabel.ForeColor = colore;
+            StatoLabel.Text = testo;
+        }
+
+        private void InizioOperazione()
+        {
+            if (_operazioniInCorso++ == 0)
+                ImpostaControlliAttivi(false);
+        }
+
+        private void FineOperazione()
+        {
+            if (--_operazioniInCorso == 0)
+                ImpostaControlliAttivi(true);
+        }
+
+        // Blocca l'interfaccia durante le operazioni: un click su griglia o pulsanti
+        // cambierebbe il lavoro selezionato o svuoterebbe la griglia
+        private void ImpostaControlliAttivi(bool attivi)
+        {
+            MyWorksDataGridView.Enabled = attivi;
+            ChoosePathButton.Enabled = attivi;
+            LoadWorksButton.Enabled = attivi;
+            ChooseBackUpFolderButton.Enabled = attivi;
+            CercaTextBox.Enabled = attivi;
+            SoloNonSalvatiCheckBox.Enabled = attivi;
+            LoadSelectedWorkButton.Enabled = attivi;
+            StudioDentistico.Enabled = attivi;
+            NomePaziente.Enabled = attivi;
+            CognomePaziente.Enabled = attivi;
+            Denti.Enabled = attivi;
+            DataLavoroPicker.Enabled = attivi;
+            AggiornaSalvatiCheckBox.Enabled = attivi;
+            BackUpButton.Enabled = attivi;
+            LoopBackUpButton.Enabled = attivi;
+            UseWaitCursor = !attivi;
         }
     }
-
 }
