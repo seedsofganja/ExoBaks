@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
 using System.Drawing;
+using System.Globalization;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -73,48 +75,39 @@ namespace ExoCAD_Tool
             MyWorksDataGridView.Rows.Clear();
             MyWorksDataGridView.Refresh();
 
-            // -----------------------------------------------------------------------
-            // OTTIMIZZAZIONE: invece di cercare su disco per ogni lavoro (lentissimo
-            // con tante cartelle), leggiamo TUTTE le sottocartelle del backup UNA SOLA
-            // volta e le mettiamo in un HashSet in memoria. La ricerca diventa O(1).
-            // -----------------------------------------------------------------------
-            var backuppedWorks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            if (!string.IsNullOrWhiteSpace(BackUpPath.Text) && Directory.Exists(BackUpPath.Text))
+            try
             {
-                foreach (string dir in Directory.GetDirectories(BackUpPath.Text, "*", SearchOption.AllDirectories))
+                // -----------------------------------------------------------------------
+                // OTTIMIZZAZIONE: invece di cercare su disco per ogni lavoro (lentissimo
+                // con tante cartelle), leggiamo TUTTE le sottocartelle del backup UNA SOLA
+                // volta e le mettiamo in un HashSet in memoria. La ricerca diventa O(1).
+                // -----------------------------------------------------------------------
+                var backuppedWorks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                if (!string.IsNullOrWhiteSpace(BackUpPath.Text) && Directory.Exists(BackUpPath.Text))
+                    ScansionaBackup(new DirectoryInfo(BackUpPath.Text), backuppedWorks);
+
+                // -----------------------------------------------------------------------
+                // Popola la griglia e colora ogni riga in base allo stato di backup
+                // -----------------------------------------------------------------------
+                string worksDir = WorksPathTextBox.Text;
+
+                foreach (string d in Directory.GetDirectories(worksDir))
                 {
-                    string dirName = Path.GetFileName(dir);
+                    string workName = Path.GetFileName(d);
+                    MyWorksDataGridView.Rows.Add(workName);
 
-                    // Il nome cartella ha il formato: "Nome Cognome Denti (NomeLavoro)"
-                    // Estraiamo il NomeLavoro che sta dentro le ultime parentesi tonde
-                    int parenOpen = dirName.LastIndexOf('(');
-                    int parenClose = dirName.LastIndexOf(')');
+                    DataGridViewRow row = MyWorksDataGridView.Rows[MyWorksDataGridView.Rows.Count - 1];
 
-                    if (parenOpen >= 0 && parenClose > parenOpen)
-                    {
-                        string workName = dirName.Substring(parenOpen + 1, parenClose - parenOpen - 1).Trim();
-                        backuppedWorks.Add(workName);
-                    }
+                    bool salvato = backuppedWorks.Contains(workName); // ricerca in memoria, istantanea
+
+                    row.DefaultCellStyle.BackColor = salvato ? Color.LightGreen : Color.LightCoral;
+                    row.DefaultCellStyle.ForeColor = Color.Black;
                 }
             }
-
-            // -----------------------------------------------------------------------
-            // Popola la griglia e colora ogni riga in base allo stato di backup
-            // -----------------------------------------------------------------------
-            string worksDir = WorksPathTextBox.Text;
-
-            foreach (string d in Directory.GetDirectories(worksDir))
+            catch (Exception ex)
             {
-                string workName = Path.GetFileName(d);
-                MyWorksDataGridView.Rows.Add(workName);
-
-                DataGridViewRow row = MyWorksDataGridView.Rows[MyWorksDataGridView.Rows.Count - 1];
-
-                bool salvato = backuppedWorks.Contains(workName); // ricerca in memoria, istantanea
-
-                row.DefaultCellStyle.BackColor = salvato ? Color.LightGreen : Color.LightCoral;
-                row.DefaultCellStyle.ForeColor = Color.Black;
+                MessageBox.Show("Errore durante il caricamento dei lavori:\n" + ex.Message, "Errore");
             }
 
             // -----------------------------------------------------------------------
@@ -133,6 +126,59 @@ namespace ExoCAD_Tool
                 ? $"⚠ {nonSalvati} lavori non salvati"
                 : "✔ Tutti i lavori sono salvati";
         }
+
+        // -----------------------------------------------------------------------
+        // Scansiona ricorsivamente la cartella di backup raccogliendo i nomi dei
+        // lavori salvati. Salta le cartelle di sistema (es. "System Volume
+        // Information" sulla radice di un disco) e quelle non accessibili.
+        // -----------------------------------------------------------------------
+        private static void ScansionaBackup(DirectoryInfo dir, HashSet<string> lavoriSalvati)
+        {
+            List<DirectoryInfo> sottoCartelle;
+            try
+            {
+                sottoCartelle = dir.EnumerateDirectories().ToList();
+            }
+            catch (UnauthorizedAccessException) { return; }
+            catch (IOException) { return; }
+
+            foreach (DirectoryInfo sub in sottoCartelle)
+            {
+                if ((sub.Attributes & FileAttributes.System) != 0)
+                    continue;
+
+                string workName = EstraiNomeLavoro(sub.Name);
+                if (workName != null)
+                    lavoriSalvati.Add(workName); // cartella paziente: non serve scendere oltre
+                else
+                    ScansionaBackup(sub, lavoriSalvati);
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Il nome cartella ha il formato: "Nome Cognome Denti (NomeLavoro)".
+        // Restituisce il NomeLavoro contenuto nelle parentesi FINALI, cercando la
+        // parentesi aperta corrispondente (così funziona anche se il nome del
+        // lavoro contiene a sua volta delle parentesi). Le cartelle che non
+        // terminano con ')' (es. backup incompleti "... (Lavoro).tmp") restituiscono null.
+        // -----------------------------------------------------------------------
+        private static string EstraiNomeLavoro(string dirName)
+        {
+            if (!dirName.EndsWith(")"))
+                return null;
+
+            int profondita = 0;
+            for (int i = dirName.Length - 1; i >= 0; i--)
+            {
+                if (dirName[i] == ')') profondita++;
+                else if (dirName[i] == '(') profondita--;
+
+                if (profondita == 0)
+                    return dirName.Substring(i + 1, dirName.Length - i - 2).Trim();
+            }
+            return null;
+        }
+
         private void LoadWorksButton_Click(object sender, EventArgs e)
         {
 
@@ -169,6 +215,11 @@ namespace ExoCAD_Tool
 
                 XmlDocument xml = new XmlDocument();
 
+                // Data di default = creazione della cartella del lavoro, così un lavoro
+                // senza DateTime non eredita la data (e l'anno) del lavoro precedente
+                Vars.dateTime = Directory.GetCreationTime(path);
+                Vars.Year = Vars.dateTime.Year;
+
                 // DentalProject — carica sempre nome, cognome, studio, data
                 if (File.Exists(dentalProject))
                 {
@@ -186,7 +237,9 @@ namespace ExoCAD_Tool
                     Vars.StudioDentistico = xmlNode?.InnerText ?? "";
 
                     xmlNode = xml.SelectSingleNode("//DateTime");
-                    if (xmlNode != null && DateTime.TryParse(xmlNode.InnerText, out DateTime dt))
+                    if (xmlNode != null &&
+                        (DateTime.TryParse(xmlNode.InnerText, out DateTime dt) ||
+                         DateTime.TryParse(xmlNode.InnerText, CultureInfo.InvariantCulture, DateTimeStyles.None, out dt)))
                     {
                         Vars.dateTime = dt;
                         Vars.Year = dt.Year;
@@ -229,8 +282,8 @@ namespace ExoCAD_Tool
                     }
                 }
 
-                // Ordina e costruisce la stringa range (es. "11-13 15 43")
-                Vars.Teeth.Sort();
+                // Rimuove i duplicati, ordina e costruisce la stringa range (es. "11-13 15 43")
+                Vars.Teeth = Vars.Teeth.Distinct().OrderBy(t => t).ToList();
                 string teethString = "";
                 int count = Vars.Teeth.Count;
                 int i = 0;
@@ -286,6 +339,10 @@ namespace ExoCAD_Tool
         // Variabile di classe per accumulare i fallimenti durante il loop
         private readonly List<string> _backupFalliti = new List<string>();
 
+        // Impostata da DoBackUp in modalità loop quando il disco di backup è pieno:
+        // il loop si interrompe invece di proseguire con tutti i lavori rimanenti
+        private bool _spazioEsaurito;
+
         public void DoBackUp(bool isLoopMode = false)
         {
             try
@@ -306,10 +363,11 @@ namespace ExoCAD_Tool
                 }
 
                 // Legge i campi dal form (potrebbero essere stati modificati manualmente)
-                string nome = NomePaziente.Text.Trim();
-                string cognome = CognomePaziente.Text.Trim();
-                string studio = StudioDentistico.Text.Trim();
-                string denti = Denti.Text.Trim();
+                // e li rende validi come nomi di cartella (es. "Rossi/Bianchi" -> "Rossi-Bianchi")
+                string nome = SanificaNome(NomePaziente.Text);
+                string cognome = SanificaNome(CognomePaziente.Text);
+                string studio = SanificaNome(StudioDentistico.Text);
+                string denti = SanificaNome(Denti.Text);
                 DateTime data = dateTimePicker1.Value;
                 string workFolder = MyWorksDataGridView.SelectedRows[0].Cells[0].Value.ToString();
 
@@ -336,33 +394,46 @@ namespace ExoCAD_Tool
                     $"{nome} {cognome} {denti} ({workFolder})"
                 );
 
-                Directory.CreateDirectory(yearFolder);
-                Directory.CreateDirectory(studioFolder);
-                Directory.CreateDirectory(pazienteFolder);
+                // Un backup nuovo viene scritto in "<cartella>.tmp" e rinominato solo a
+                // copia completata: se si interrompe, il lavoro resta "non salvato"
+                // (CaricaLavori ignora le cartelle che non terminano con ')').
+                // Se la cartella esiste già, si aggiornano i file al suo interno.
+                bool cartellaNuova = !Directory.Exists(pazienteFolder);
+                string cartellaDestinazione = cartellaNuova ? pazienteFolder + ".tmp" : pazienteFolder;
+
+                Directory.CreateDirectory(cartellaDestinazione);
 
                 // --- Copia i file uno per uno ---
-                DriveInfo driveInfo = new DriveInfo(Path.GetPathRoot(BackUpPath.Text));
-
                 foreach (string file in Directory.GetFiles(workPath))
                 {
-                    string destPath = Path.Combine(pazienteFolder, Path.GetFileName(file));
+                    string destPath = Path.Combine(cartellaDestinazione, Path.GetFileName(file));
 
-                    if (File.Exists(destPath))
-                        continue; // già copiato in precedenza, salta
+                    if (FileGiaCopiato(file, destPath))
+                        continue; // già copiato e invariato, salta
 
                     long fileSize = new FileInfo(file).Length;
-                    long freeSpace = driveInfo.AvailableFreeSpace; // riletto ad ogni file
+                    long freeSpace = SpazioLibero(BackUpPath.Text); // riletto ad ogni file, -1 se non disponibile
 
-                    if (freeSpace <= fileSize)
+                    if (freeSpace >= 0 && freeSpace <= fileSize)
                     {
                         string motivo = "Spazio sul disco di backup esaurito";
-                        MessageBox.Show(motivo, "Spazio insufficiente");
                         RegistraFallimento(workFolder, nome, cognome, denti, data, motivo);
+
+                        if (isLoopMode)
+                            _spazioEsaurito = true; // il messaggio lo mostra il loop, una volta sola
+                        else
+                            MessageBox.Show(motivo, "Spazio insufficiente");
+
+                        label1.ForeColor = Color.Red;
+                        label1.Text = motivo;
                         return;
                     }
 
-                    File.Copy(file, destPath);
+                    CopiaFileSicura(file, destPath);
                 }
+
+                if (cartellaNuova)
+                    Directory.Move(cartellaDestinazione, pazienteFolder);
 
                 label1.ForeColor = Color.Green;
                 label1.Text = "Lavoro salvato";
@@ -396,6 +467,76 @@ namespace ExoCAD_Tool
                 }
                 catch { /* ignora errori secondari nel log */ }
             }
+        }
+
+        // -----------------------------------------------------------------------
+        // Rende un testo valido come nome di cartella: sostituisce i caratteri non
+        // ammessi da Windows con '-' e toglie spazi e punti finali.
+        // -----------------------------------------------------------------------
+        private static string SanificaNome(string testo)
+        {
+            char[] nonValidi = Path.GetInvalidFileNameChars();
+            var sb = new StringBuilder(testo.Length);
+            foreach (char c in testo)
+                sb.Append(nonValidi.Contains(c) ? '-' : c);
+
+            return sb.ToString().Trim().TrimEnd('.', ' ');
+        }
+
+        // -----------------------------------------------------------------------
+        // Un file è considerato già copiato solo se esiste con stessa dimensione e
+        // stessa data di modifica (tolleranza 2s per dischi FAT/exFAT): così i file
+        // copiati a metà o modificati in ExoCAD dopo il backup vengono ricopiati.
+        // -----------------------------------------------------------------------
+        private static bool FileGiaCopiato(string origine, string destinazione)
+        {
+            if (!File.Exists(destinazione))
+                return false;
+
+            var o = new FileInfo(origine);
+            var d = new FileInfo(destinazione);
+            return o.Length == d.Length &&
+                   Math.Abs((o.LastWriteTimeUtc - d.LastWriteTimeUtc).TotalSeconds) <= 2;
+        }
+
+        // -----------------------------------------------------------------------
+        // Copia su un file ".part" e lo rinomina solo a copia completata: un file
+        // interrotto a metà non viene mai scambiato per un file valido.
+        // -----------------------------------------------------------------------
+        private static void CopiaFileSicura(string origine, string destinazione)
+        {
+            string temp = destinazione + ".part";
+
+            if (File.Exists(temp))
+                File.SetAttributes(temp, FileAttributes.Normal);
+            File.Copy(origine, temp, true);
+
+            if (File.Exists(destinazione))
+            {
+                File.SetAttributes(destinazione, FileAttributes.Normal);
+                File.Delete(destinazione);
+            }
+            File.Move(temp, destinazione);
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetDiskFreeSpaceEx(string lpDirectoryName,
+            out ulong lpFreeBytesAvailable, out ulong lpTotalNumberOfBytes, out ulong lpTotalNumberOfFreeBytes);
+
+        // -----------------------------------------------------------------------
+        // Spazio libero sul disco che contiene la cartella. Funziona anche con
+        // percorsi di rete (\\NAS\backup), dove DriveInfo lancia un'eccezione.
+        // Restituisce -1 se non è possibile determinarlo.
+        // -----------------------------------------------------------------------
+        private static long SpazioLibero(string cartella)
+        {
+            string percorso = cartella.EndsWith("\\") ? cartella : cartella + "\\";
+
+            if (GetDiskFreeSpaceEx(percorso, out ulong libero, out _, out _))
+                return (long)Math.Min(libero, (ulong)long.MaxValue);
+
+            return -1;
         }
 
         // -----------------------------------------------------------------------
@@ -454,39 +595,69 @@ namespace ExoCAD_Tool
         private async void LoopBackUpButton_Click(object sender, EventArgs e)
         {
             _backupFalliti.Clear(); // pulisce i fallimenti del run precedente
+            _spazioEsaurito = false;
 
             int totale = MyWorksDataGridView.Rows.Count;
             progressBar1.Value = 0;
             progressBar1.Maximum = totale;
             progressBar1.Step = 1;
 
-            LoopBackUpButton.Enabled = false;
-            BackUpButton.Enabled = false;
+            // Blocca tutta l'interfaccia: un click su griglia o pulsanti durante il
+            // loop cambierebbe il lavoro selezionato o svuoterebbe la griglia
+            ImpostaInterfacciaAttiva(false);
 
-            foreach (DataGridViewRow row in MyWorksDataGridView.Rows)
+            string msg;
+            try
             {
-                row.Selected = true;
-                MyWorksDataGridView.CurrentCell = MyWorksDataGridView.Rows[row.Index].Cells[0];
+                foreach (DataGridViewRow row in MyWorksDataGridView.Rows)
+                {
+                    row.Selected = true;
+                    MyWorksDataGridView.CurrentCell = MyWorksDataGridView.Rows[row.Index].Cells[0];
 
-                await Task.Delay(1); // lascia aggiornare la UI senza bloccare il thread
+                    await Task.Delay(1); // lascia aggiornare la UI senza bloccare il thread
 
-                DoBackUp(isLoopMode: true); // passa true: non ricarica la griglia ad ogni passo
+                    DoBackUp(isLoopMode: true); // passa true: non ricarica la griglia ad ogni passo
 
-                progressBar1.Value++;
-                await Task.Delay(1);
+                    progressBar1.Value++;
+
+                    if (_spazioEsaurito)
+                        break;
+
+                    await Task.Delay(1);
+                }
+
+                CaricaLavori();          // ricarica la griglia UNA SOLA VOLTA alla fine
+                ScriviLogFalliti();      // scrive il log solo se ci sono stati problemi
+
+                if (_spazioEsaurito)
+                    msg = "Backup interrotto: spazio esaurito sul disco di backup.";
+                else if (_backupFalliti.Count == 0)
+                    msg = "Backup completato senza errori ✔";
+                else
+                    msg = $"Backup completato con {_backupFalliti.Count} errori.\nVedi il file log nella cartella di backup.";
+            }
+            catch (Exception ex)
+            {
+                msg = "Backup interrotto per un errore:\n" + ex.Message;
+            }
+            finally
+            {
+                ImpostaInterfacciaAttiva(true);
             }
 
-            CaricaLavori();          // ricarica la griglia UNA SOLA VOLTA alla fine
-            ScriviLogFalliti();      // scrive il log solo se ci sono stati problemi
-
-            LoopBackUpButton.Enabled = true;
-            BackUpButton.Enabled = true;
-
-            string msg = _backupFalliti.Count == 0
-                ? "Backup completato senza errori ✔"
-                : $"Backup completato con {_backupFalliti.Count} errori.\nVedi il file log nella cartella di backup.";
-
             MessageBox.Show(msg, "Backup");
+        }
+
+        private void ImpostaInterfacciaAttiva(bool attiva)
+        {
+            MyWorksDataGridView.Enabled = attiva;
+            ChoosePathButton.Enabled = attiva;
+            LoadWorksButton.Enabled = attiva;
+            LoadSelectedWorkButton.Enabled = attiva;
+            ChooseBackUpFolderButton.Enabled = attiva;
+            BackUpButton.Enabled = attiva;
+            LoopBackUpButton.Enabled = attiva;
+            UseWaitCursor = !attiva;
         }
 
         private bool IsWorkBackedUp(string workName)
